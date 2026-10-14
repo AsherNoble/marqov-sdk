@@ -26,6 +26,14 @@ release.
   existing Lightning circuit hashes are unchanged. Symbolic and extended-precision
   serialization remain separate decisions. (marqov-sdk#194, numeric slice)
 
+### Added
+
+- Independent installed-wheel Python 3.13 qualification and a user-facing
+  compatibility matrix with exact dependency records. Seventeen Linux profiles
+  feed required CI; Rigetti, pyQuil and the all-extras bundle retain visible
+  installation restrictions. Native GPU, live provider and deployed-runtime
+  qualification remain separate.
+
 ## [0.9.0] — 2026-10-08
 
 ### Fixed
