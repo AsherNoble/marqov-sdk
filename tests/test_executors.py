@@ -1047,3 +1047,134 @@ class TestProviderListDocSync:
 
         for provider in ExecutorFactory.get_supported_providers():
             assert provider in table, f"{provider!r} missing from README Supported Backends table"
+
+    def test_every_readme_backend_row_is_a_supported_provider(self) -> None:
+        """Reverse direction (marqov-sdk#139): a README row with no provider behind it must fail.
+
+        Matches on a provider name appearing in the row's first cell, because the
+        status cells carry install caveats and the first cells carry parentheticals.
+        """
+        readme_path = Path(__file__).resolve().parent.parent / "README.md"
+        readme = readme_path.read_text()
+
+        start = readme.index("## Supported Backends")
+        end = readme.index("\n---", start)
+        rows = [
+            line for line in readme[start:end].splitlines()
+            if line.startswith("|") and not line.startswith("|---") and not line.startswith("| Backend ")
+        ]
+        assert rows, "no rows parsed from the README Supported Backends table"
+
+        # Row labels that differ from the registry's provider key.
+        aliases = {
+            "Local (QuantumFlow simulator)": "Local",
+            "CESGA CUNQA": "CUNQA",
+        }
+        providers = ExecutorFactory.get_supported_providers()
+        for row in rows:
+            first_cell = row.split("|")[1].strip()
+            matched = [
+                p for p in providers
+                if p in first_cell or any(k in first_cell and v == p for k, v in aliases.items())
+            ]
+            assert matched, f"README row {first_cell!r} has no provider in get_supported_providers()"
+
+    def test_factory_module_docstring_mentions_every_provider(self) -> None:
+        """marqov-sdk#139: the factory module docstring enumerates every returned provider."""
+        import marqov.executors.factory as factory_module
+
+        doc = factory_module.__doc__ or ""
+        for provider in ExecutorFactory.get_supported_providers():
+            assert provider in doc, f"{provider!r} missing from factory.py module docstring"
+
+    def test_get_supported_providers_docstring_example_matches_return(self) -> None:
+        """marqov-sdk#139: the docstring example is compared to the real return value."""
+        import ast
+
+        doc = ExecutorFactory.get_supported_providers.__doc__ or ""
+        marker = ">>> ExecutorFactory.get_supported_providers()\n"
+        after = doc.split(marker, 1)[1]
+        example = ast.literal_eval(after.strip().splitlines()[0].strip())
+        assert example == ExecutorFactory.get_supported_providers()
+
+
+class TestCUNQAFactoryDispatch:
+    """marqov-sdk#139: CUNQA is reachable through ExecutorFactory.create_executor."""
+
+    def test_create_executor_carries_config_values_and_defaults(self) -> None:
+        from marqov.executors import CUNQAExecutor
+
+        with patch("marqov.executors.cunqa._CunqaModuleClient", MagicMock()):
+            executor = ExecutorFactory.create_executor(
+                "cunqa",
+                {
+                    "provider": "CUNQA",
+                    "n_qpus": 8,
+                    "walltime": "00:30:00",
+                    "co_located": False,
+                    "mem_per_qpu_gb": 2,
+                },
+            )
+        assert isinstance(executor, CUNQAExecutor)
+        cfg = executor._config
+        assert (cfg.n_qpus, cfg.walltime, cfg.co_located, cfg.mem_per_qpu_gb) == (
+            8, "00:30:00", False, 2,
+        )
+        # Omitted keys fall back to the dataclass defaults.
+        assert (cfg.simulator, cfg.classical_comm, cfg.quantum_comm) == ("Aer", False, False)
+        assert (cfg.startup_timeout_s, cfg.poll_interval_s) == (60.0, 1.0)
+
+    def test_provider_is_listed(self) -> None:
+        assert "CUNQA" in ExecutorFactory.get_supported_providers()
+
+    def test_importing_factory_does_not_import_cunqa(self) -> None:
+        """Method: fresh subprocess; assert the cunqa package is absent from sys.modules."""
+        import subprocess
+        import sys
+
+        code = (
+            "import sys; import marqov.executors.factory; "
+            "sys.exit(1 if 'cunqa' in sys.modules else 0)"
+        )
+        assert subprocess.run([sys.executable, "-c", code]).returncode == 0
+
+
+class TestCUNQAFactoryConfigValidation:
+    """CUNQA config values are type-checked in the factory, naming the bad key."""
+
+    @pytest.mark.parametrize(
+        ("key", "value", "received"),
+        [
+            ("n_qpus", "4", "str"),
+            ("n_qpus", True, "bool"),
+            ("n_qpus", 4.0, "float"),
+            ("mem_per_qpu_gb", "4", "str"),
+            ("startup_timeout_s", "60", "str"),
+            ("poll_interval_s", None, "NoneType"),
+            ("poll_interval_s", True, "bool"),
+            ("co_located", "true", "str"),
+            ("classical_comm", 1, "int"),
+            ("simulator", 3, "int"),
+            ("walltime", 600, "int"),
+        ],
+    )
+    def test_bad_value_raises_naming_key_and_type(self, key: str, value: Any, received: str) -> None:
+        with pytest.raises(ValueError) as exc_info:
+            ExecutorFactory.create_executor("cunqa", {"provider": "CUNQA", key: value})
+        message = str(exc_info.value)
+        assert repr(key) in message
+        assert received in message
+
+    def test_int_accepted_for_float_fields(self) -> None:
+        with patch("marqov.executors.cunqa._CunqaModuleClient", MagicMock()):
+            executor = ExecutorFactory.create_executor(
+                "cunqa", {"provider": "CUNQA", "startup_timeout_s": 30, "poll_interval_s": 2}
+            )
+        assert executor._config.startup_timeout_s == 30
+        assert executor._config.poll_interval_s == 2
+
+    def test_seed_key_is_rejected_because_it_is_not_applied(self) -> None:
+        with pytest.raises(ValueError) as exc_info:
+            ExecutorFactory.create_executor("cunqa", {"provider": "CUNQA", "seed": 7})
+        assert "'seed'" in str(exc_info.value)
+        assert "omit" in str(exc_info.value)
