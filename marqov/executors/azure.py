@@ -524,35 +524,55 @@ class AzureQuantumExecutor(BaseExecutor):
     _AZURE_STATUS_MAP = {
         "Available": "online",
         "Degraded": "maintenance",
+        "Unavailable": "offline",
+        "Unknown": "maintenance",
     }
 
     async def get_status(self) -> DeviceStatus:
-        """Get live device status from Azure Quantum."""
+        """Get live device status from Azure Quantum.
+
+        A failed lookup (credentials, network, target not found) reports
+        ``maintenance`` rather than ``offline``: the state could not be read.
+        When the workspace is reachable but has no target with the configured
+        name, a warning logs the configured name and the names it returned.
+        """
         try:
-            raw_status = await self.get_device_status()
-            status = self._AZURE_STATUS_MAP.get(raw_status, "offline")
-            return DeviceStatus(status=status, queue_depth=None, queue_time_seconds=None)
+            raw_status = await self._read_device_status()
         except Exception:
-            return DeviceStatus(status="maintenance", queue_depth=None, queue_time_seconds=None)
+            raw_status = "Unknown"
+        status = self._AZURE_STATUS_MAP.get(raw_status, "maintenance")
+        return DeviceStatus(status=status, queue_depth=None, queue_time_seconds=None)
+
+    async def _read_device_status(self) -> str:
+        """Read ``current_availability`` for the target; raises on any failure."""
+        workspace = await self._get_workspace()
+        loop = asyncio.get_running_loop()
+
+        def get_status_sync():
+            targets = list(workspace.get_targets())
+            for target in targets:
+                if target.name == self.config.target:
+                    return target.current_availability
+            logger.warning(
+                "Azure target %r not found in workspace %r; available targets: %s",
+                self.config.target,
+                self.config.workspace_name,
+                sorted(str(target.name) for target in targets),
+            )
+            return None
+
+        status = await loop.run_in_executor(None, get_status_sync)
+        return status or "Unknown"
 
     async def get_device_status(self) -> str:
         """Get current device status.
 
         Returns:
-            Device status string (e.g., "Available", "Unavailable").
+            Azure's ``current_availability`` ("Available", "Degraded" or
+            "Unavailable"), or "Unknown" if it could not be read.
         """
         try:
-            workspace = await self._get_workspace()
-            loop = asyncio.get_running_loop()
-
-            def get_status_sync():
-                targets = workspace.get_targets()
-                for target in targets:
-                    if target.name == self.config.target:
-                        return target.current_availability
-
-            status = await loop.run_in_executor(None, get_status_sync)
-            return status or "Unknown"
+            return await self._read_device_status()
         except Exception:
             return "Unknown"
 
@@ -560,7 +580,8 @@ class AzureQuantumExecutor(BaseExecutor):
         """Check if device is available for execution.
 
         Returns:
-            True if device is available, False otherwise.
+            True only when Azure reports "Available". "Degraded",
+            "Unavailable" and an unreadable status all return False.
         """
         status = await self.get_device_status()
-        return "available" in status.lower() if status else False
+        return status.strip().lower() == "available"
