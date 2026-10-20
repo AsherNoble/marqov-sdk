@@ -167,30 +167,44 @@ def _unbox_numpy_scalar(value: Any) -> Any:
     return value
 
 
+def _cloudpickle_envelope(value: Any) -> dict[str, Any]:
+    """Wrap a non-JSON-native value in the ``__cloudpickle__`` transport envelope.
+
+    Used for task results (``_serialize_value``; ``_task_child`` keeps its own
+    copy of the same shape) and for task arguments (``decorators._transport_arg``),
+    so both directions use one envelope shape.
+    """
+    import cloudpickle
+
+    return {
+        "__cloudpickle__": True,
+        "data": base64.b64encode(cloudpickle.dumps(value)).decode("utf-8"),
+    }
+
+
 def _serialize_value(value: Any) -> Any:
     """Serialize a value for JSON transport.
 
     Uses cloudpickle for complex objects, JSON-compatible types pass through.
     NumPy bool/integer/float scalars are unboxed to Python bool/int/float.
-    """
-    import cloudpickle
+    A dict with any non-str key is pickled whole so it keeps its keys (JSON
+    would turn them into strings).
 
+    Mirrored in _task_child._serialize_value; keep the two in sync.
+    """
     value = _unbox_numpy_scalar(value)
     if value is None or isinstance(value, (bool, int, float, str)):
         return value
     elif isinstance(value, (list, tuple)):
         return [_serialize_value(item) for item in value]
-    elif isinstance(value, dict):
+    elif isinstance(value, dict) and all(isinstance(k, str) for k in value):
         # Check for our special marker types
         if value.get("__cloudpickle__"):
             return value
         return {k: _serialize_value(v) for k, v in value.items()}
     else:
         # Complex object - use cloudpickle
-        return {
-            "__cloudpickle__": True,
-            "data": base64.b64encode(cloudpickle.dumps(value)).decode("utf-8"),
-        }
+        return _cloudpickle_envelope(value)
 
 
 def _kill_process_group(proc: asyncio.subprocess.Process) -> None:
@@ -233,6 +247,9 @@ async def execute_task(
         provider_env: Optional provider credentials to inject into the child env
             (e.g. AWS keys for a Braket task).  Never inherited from the parent
             process env — only what is explicitly passed here enters the child.
+            ``JobWorkflow`` never passes it, so a task dispatched through
+            ``WorkflowDispatch`` runs with no provider credentials. A host
+            runner that invokes this activity itself must supply them.
 
     Returns:
         JSON-encoded result with node_id and opaque result blob.
