@@ -21,6 +21,7 @@ import asyncio
 import base64
 import json
 import os
+import shutil
 import signal
 import sys
 from collections import deque
@@ -30,7 +31,11 @@ from typing import Any
 from temporalio import activity
 from temporalio.exceptions import ApplicationError
 
-from marqov.workflows._child_env import build_child_env, new_task_workdir
+from marqov.workflows._child_env import (
+    build_child_env,
+    keep_task_workdir_requested,
+    new_task_workdir,
+)
 
 # Heartbeat interval for execute_task. Temporal throttles forwarding to 80%
 # of heartbeat_timeout (48s for 60s timeout), so the send interval just needs
@@ -212,6 +217,9 @@ def _kill_process_group(proc: asyncio.subprocess.Process) -> None:
 
     ``start_new_session=True`` makes pgid == pid, so grandchildren die with it
     instead of lingering (mirrors dwave_executor._kill_process_group).
+    Safe to call after the child has exited: a group with no members left
+    raises ProcessLookupError, and ``proc.kill()`` on a reaped child is a no-op
+    or raises ProcessLookupError, both of which are swallowed.
     """
     try:
         os.killpg(proc.pid, signal.SIGKILL)
@@ -239,6 +247,15 @@ async def execute_task(
     and validated here (shape plus node_id), because the child owns its
     workdir and must not be able to name a different node.
 
+    When the child exits, its whole process group is killed, so a process the
+    task body left running does not outlive the task. The task's workdir is
+    then removed (in a thread, off the event loop) once the output has been
+    read, whether the task succeeded, failed or was cancelled (a Temporal
+    timeout arrives as a cancellation, and a further cancellation during the
+    removal does not cut it short). Setting ``MARQOV_KEEP_TASK_WORKDIR``
+    to ``1``, ``true``, ``yes`` or ``on`` keeps it and logs its path, as a
+    debugging aid.
+
     Args:
         node_id: Unique identifier for this node.
         func_ref: Base64-encoded cloudpickle of the function.
@@ -260,6 +277,46 @@ async def execute_task(
             or whose ``node_id`` does not match this activity's ``node_id``.
     """
     workdir = new_task_workdir(node_id)
+    try:
+        return await _run_task_in_workdir(
+            workdir, node_id, func_ref, args_json, kwargs_json, provider_env
+        )
+    finally:
+        if keep_task_workdir_requested():
+            activity.logger.info("Keeping workdir for node %s: %s", node_id, workdir)
+        else:
+            await _remove_task_workdir(workdir)
+
+
+async def _remove_task_workdir(workdir: Path) -> None:
+    """Remove ``workdir`` off the event loop, finishing even if cancelled meanwhile.
+
+    The removal runs in a thread so a large workdir does not stall heartbeats.
+    It is shielded, and a cancellation that arrives while it runs is held
+    back until the removal has finished, then re-raised.
+    """
+    removal = asyncio.ensure_future(
+        asyncio.to_thread(shutil.rmtree, workdir, ignore_errors=True)
+    )
+    cancelled = False
+    while not removal.done():
+        try:
+            await asyncio.shield(removal)
+        except asyncio.CancelledError:
+            cancelled = True
+    if cancelled:
+        raise asyncio.CancelledError
+
+
+async def _run_task_in_workdir(
+    workdir: Path,
+    node_id: str,
+    func_ref: str,
+    args_json: str,
+    kwargs_json: str,
+    provider_env: dict[str, str] | None,
+) -> str:
+    """Body of ``execute_task``: run the child in ``workdir`` and read its output."""
     result_path = workdir / "result.json"
 
     # Write inputs for the child.  func_ref is base64-encoded; write the text
@@ -311,6 +368,10 @@ async def execute_task(
 
     try:
         await child_task
+        # Anything the task body left running in its process group (a
+        # grandchild) dies now, before the output is read and the workdir is
+        # removed, so it cannot rewrite either afterwards.
+        _kill_process_group(proc)
         if stderr_task is not None:
             # The child has exited; let the reader reach EOF so the tail is
             # complete before it is used in an error message.
