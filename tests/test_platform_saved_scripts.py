@@ -151,6 +151,40 @@ def test_unreadable_submit_receipt_holds_with_effective_operation_key(response):
     UUID(failure.value.idempotency_key)
 
 
+def _html_reply(status, sent):
+    def request(method, url, **kwargs):
+        sent.append(kwargs)
+        response = requests.Response()
+        response.status_code = status
+        response._content = b"<html>captive portal</html>"
+        response.headers["Content-Type"] = "text/html"
+        return response
+
+    return request
+
+
+def test_non_json_save_response_carries_the_sent_key():
+    client = MarqovClient(api_key="fixture", base_url="https://test.invalid")
+    sent = []
+    client._transport._session.request = _html_reply(200, sent)
+    with pytest.raises(TransportError) as failure:
+        client.save_script(SOURCE, name="n")
+    assert failure.value.idempotency_key == sent[0]["headers"]["Idempotency-Key"]
+
+
+@pytest.mark.parametrize("status", [200, 302, 304])
+def test_non_json_submit_response_holds_with_effective_operation_key(status):
+    client = MarqovClient(api_key="fixture", base_url="https://test.invalid")
+    sent = []
+    client._transport._session.request = _html_reply(status, sent)
+    with pytest.raises(TransportError) as failure:
+        client.submit_script(SCRIPT, backend="local", analysis_id=ANALYSIS)
+    assert len(sent) == 1
+    assert failure.value.code == "submission_outcome_unknown"
+    assert failure.value.idempotency_key == sent[0]["headers"]["Idempotency-Key"]
+    assert isinstance(failure.value.__cause__, ValueError)
+
+
 @pytest.mark.parametrize(
     "shots,accepted",
     [(np.int64(16), True), (np.uint8(16), True), (True, False), (3.0, False), (0, False)],

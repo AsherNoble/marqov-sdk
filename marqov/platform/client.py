@@ -40,7 +40,7 @@ from __future__ import annotations
 import hashlib
 import numbers
 import uuid
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping, Self, Sequence
 from uuid import UUID
 
 import marqov
@@ -48,7 +48,7 @@ from marqov.circuits import Circuit
 
 from ._models import Backend, PlatformInfo
 from ._native import build_public_submission, check_receipt, parse_runtimes, require_uuid
-from ._transport import Transport
+from ._transport import Transport, _UnreadableSuccessBody
 from .errors import MarqovPlatformError, TransportError
 from .job import Job
 
@@ -73,11 +73,14 @@ class MarqovClient:
         :class:`~marqov.platform.errors.AuthenticationError`: If no API key is
             resolved from the argument or environment.
 
+    The client holds a pooled HTTP session.  Call :meth:`close` when done, or
+    use the client as a context manager, which closes it on exit.
+
     Example::
 
-        client = MarqovClient(api_key="marqey_live_abc123")
-        job    = client.submit(circuit, backend="sv1")
-        result = job.result()
+        with MarqovClient(api_key="marqey_live_abc123") as client:
+            job    = client.submit(circuit, backend="sv1")
+            result = job.result()
     """
 
     def __init__(
@@ -92,6 +95,23 @@ class MarqovClient:
             base_url=base_url,
             timeout=timeout,
         )
+
+    def close(self) -> None:
+        """Close the client's HTTP session and release its pooled sockets.
+
+        Idempotent: a second call does nothing.  Using the client after
+        ``close()`` is not supported.  Prefer the context-manager form::
+
+            with MarqovClient() as client:
+                ...
+        """
+        self._transport.close()
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.close()
 
     # ------------------------------------------------------------------
     # Public API
@@ -375,16 +395,20 @@ class MarqovClient:
                 resp, input_text=input_text, source=source, source_sha256=source_sha256
             )
         except MarqovPlatformError as exc:
-            exc.idempotency_key = key
-            raise
-        except Exception as exc:  # e.g. a 2xx whose body is not JSON
-            raise TransportError(
-                "The platform's response could not be read; the submission may or may "
-                "not have been admitted. Resubmit with the same idempotency_key to confirm.",
-                code="submission_outcome_unknown",
-                idempotency_key=key,
-            ) from exc
-        return Job(self._transport, job_id)
+            if not _is_unreadable_success(exc):
+                exc.idempotency_key = key
+                raise
+            cause: BaseException = exc.__cause__ or exc
+        except Exception as exc:
+            cause = exc
+        else:
+            return Job(self._transport, job_id)
+        raise TransportError(
+            "The platform's response could not be read; the submission may or may "
+            "not have been admitted. Resubmit with the same idempotency_key to confirm.",
+            code="submission_outcome_unknown",
+            idempotency_key=key,
+        ) from cause
 
     def save_script(
         self,
@@ -527,16 +551,20 @@ class MarqovClient:
             )
             job_id = _script_uuid(response["job_id"], "job_id")
         except MarqovPlatformError as exc:
-            exc.idempotency_key = key
-            raise
+            if not _is_unreadable_success(exc):
+                exc.idempotency_key = key
+                raise
+            cause: BaseException = exc.__cause__ or exc
         except Exception as exc:
-            raise TransportError(
-                "The submission response could not be read; admission may have occurred. "
-                "Preserve the operation key and reconcile before submitting again.",
-                code="submission_outcome_unknown",
-                idempotency_key=key,
-            ) from exc
-        return Job(transport=self._transport, job_id=job_id)
+            cause = exc
+        else:
+            return Job(transport=self._transport, job_id=job_id)
+        raise TransportError(
+            "The submission response could not be read; admission may have occurred. "
+            "Preserve the operation key and reconcile before submitting again.",
+            code="submission_outcome_unknown",
+            idempotency_key=key,
+        ) from cause
 
     def job(self, job_id: str) -> Job:
         """Reconnect to an existing job by ID.
@@ -641,6 +669,15 @@ class MarqovClient:
             sdk_version=marqov.__version__,
             api_version=api_version,
         )
+
+
+def _is_unreadable_success(exc: MarqovPlatformError) -> bool:
+    """Report whether `exc` is the transport's failure for a non-JSON success body.
+
+    The server answered (any ``resp.ok`` status, 3xx included), but what it
+    said cannot be read.
+    """
+    return isinstance(exc, _UnreadableSuccessBody)
 
 
 def _nonempty(value: str, name: str) -> None:
