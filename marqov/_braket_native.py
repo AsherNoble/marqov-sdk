@@ -129,3 +129,19 @@ def prepare_braket(
             from braket.circuits import Circuit as circuit_factory
         output = circuit_factory().add_verbatim_box(output)
     return output
+
+
+def widen_logical_counts(circuit: Any, counts: dict[str, int], result: Any) -> dict[str, int]:
+    """Key logical-path Braket counts over qubits ``0..circuit.num_qubits-1``.
+
+    ``Circuit.to_braket()`` sends no identity wire to Braket, so the provider
+    measures only the touched qubits. Character ``j`` of a provider key is
+    ``result.measured_qubits[j]``, or the ``j``-th touched qubit in ascending
+    order (Braket's default measurement order) when the result does not
+    report them. See ``marqov.executors._counts.widen_counts``. Callers skip
+    this for circuits without identity wires and for the native
+    label-preserving path, whose counts stay as returned.
+    """
+    from marqov.executors._counts import widen_counts
+
+    return widen_counts(circuit, counts, getattr(result, "measured_qubits", None), "Braket")

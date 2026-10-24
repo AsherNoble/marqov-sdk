@@ -44,6 +44,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 
 from marqov.executors._blocking import BlockingCalls
+from marqov.executors._counts import refuse_identity_only, widen_counts
 from marqov.executors.base import (
     BaseExecutor,
     DeviceStatus,
@@ -94,8 +95,11 @@ class RigettiExecutor(BaseExecutor):
     Converts a circuit with ``to_pyquil()``, measures every qubit into a ``ro``
     register, compiles with ``quilc`` and runs the program on a pyquil
     ``QuantumComputer``. Counts use the SDK convention where qubit 0 is the
-    leftmost bit for dense circuits. For sparse physical labels, counts keys
-    follow ascending active labels recorded in ``metadata.measured_qubits``.
+    leftmost bit and keys have ``circuit.num_qubits`` characters. Quil labels
+    are physical qubits on QCS, so only the touched qubits are measured
+    (``metadata.measured_qubits``, ascending); a ``'0'`` is inserted at each
+    identity-wire position (``metadata.identity_wires``), since an untouched
+    wire is always in state 0.
 
     A ``QuantumComputer`` may be injected for unit testing without a running QVM
     or QCS credentials.
@@ -197,8 +201,8 @@ class RigettiExecutor(BaseExecutor):
 
         Reads the ``ro`` register (a ``shots`` x ``num_qubits`` array of bits) and
         bins the per-shot bitstrings. The first measured qubit is leftmost;
-        for dense wires this is qubit 0. Sparse physical labels are recorded
-        in ``metadata.measured_qubits`` in ascending order.
+        this is qubit 0. The measured labels are recorded in
+        ``metadata.measured_qubits`` in ascending order.
 
         Args:
             result: The object returned by ``QuantumComputer.run`` (exposes
@@ -255,8 +259,10 @@ class RigettiExecutor(BaseExecutor):
         Raises:
             TypeError: If any keyword option is supplied.
             RuntimeError: If compilation, execution or readout validation fails.
-            ValueError: If shots are not positive integers or the exported active
-                qubit count differs from the circuit.
+            ValueError: If shots are not positive integers, the circuit has
+                gates but none other than identities (the Quil program would
+                be empty), or the exported program's qubit labels are not the
+                circuit's non-identity qubits.
             TimeoutError: If execution exceeds ``config.timeout_seconds``.
         """
         reject_unsupported_options("RigettiExecutor.execute()", kwargs)
@@ -286,10 +292,13 @@ class RigettiExecutor(BaseExecutor):
                 metadata=self._metadata(0, shots, 0.0),
             )
 
+        refuse_identity_only(circuit, "Rigetti")
         program = circuit.to_pyquil()  # type: ignore[no-untyped-call]
         measured_qubits = sorted(program.get_qubit_indices())
-        if len(measured_qubits) != num_qubits:
-            raise ValueError("Rigetti export does not preserve the circuit's active qubit count")
+        idle = circuit._idle_qubits()
+        touched = [q for q in range(num_qubits) if q not in idle]
+        if measured_qubits != touched:
+            raise ValueError("Rigetti export does not preserve the circuit's qubit labels")
         measured = self._build_measured_program(program, measured_qubits, shots)
 
         identity: dict[str, Any] = {
@@ -357,7 +366,7 @@ class RigettiExecutor(BaseExecutor):
                         identity["phase"] = "execution"
                         result = await calls.call(qc.run, executable)
             wall_time = time.perf_counter() - start_time
-            counts = self._result_to_counts(result, num_qubits, shots)
+            counts = self._result_to_counts(result, len(measured_qubits), shots)
         except (TimeoutError, asyncio.CancelledError) as error:
             error.remote_job = dict(identity)  # type: ignore[union-attr]
             error.add_note(
@@ -373,17 +382,23 @@ class RigettiExecutor(BaseExecutor):
             failure.remote_job = dict(identity)  # type: ignore[attr-defined]
             raise failure from exc
 
+        metadata = {
+            **self._metadata(num_qubits, shots, wall_time * 1000),
+            **identity,
+            "measured_qubits": measured_qubits,
+        }
+        # Identity wires were not measured; put their '0' back in each key.
+        if idle:
+            counts = widen_counts(circuit, counts, measured_qubits, "Rigetti")
+            metadata["identity_wires"] = idle
+
         return ExecutionResult(
             counts=counts,
             backend=identity["quantum_processor_id"],
             execution_time_ms=wall_time * 1000,
             shots=shots,
             raw_result=result,
-            metadata={
-                **self._metadata(num_qubits, shots, wall_time * 1000),
-                **identity,
-                "measured_qubits": measured_qubits,
-            },
+            metadata=metadata,
         )
 
     async def cancel(self, job_id: str) -> bool:
@@ -410,7 +425,7 @@ class RigettiExecutor(BaseExecutor):
         """Build the ExecutionResult metadata for a run.
 
         Args:
-            num_qubits: Number of qubits measured.
+            num_qubits: Circuit width, the length of each counts key.
             shots: Number of shots executed.
             wall_time_ms: Measured wall time in milliseconds.
 

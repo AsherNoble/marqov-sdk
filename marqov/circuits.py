@@ -42,6 +42,15 @@ class Circuit:
     Provides a fluent API for building circuits that can be converted
     to any supported backend (Braket, Qiskit, Cirq, PyQuil).
 
+    Qubits are nonnegative integer indices. The circuit width is the largest
+    index any gate touches plus one, so ``Circuit().x(2)`` has three qubits:
+    an index below the largest that no gate touches is an identity wire, kept
+    in simulation and in counts keys rather than removed. Qubit ``i`` is
+    always register index ``i`` in an export (labels are never compacted),
+    and character ``i`` of a counts key from ``LocalExecutor``, so qubit 0 is
+    the leftmost character (``Circuit().x(2)`` yields ``{"001": shots}``).
+    Each exporter's docstring says how it carries identity wires.
+
     Example:
         >>> circuit = Circuit()
         >>> circuit.h(0).cnot(0, 1)  # Bell state
@@ -225,11 +234,21 @@ class Circuit:
     def to_braket(self) -> BraketCircuit:
         """Convert to Amazon Braket circuit.
 
+        Qubit ``i`` stays Braket qubit ``i``; labels are not compacted. A
+        Braket circuit has no register width, and not every Braket QPU lists
+        the ``i`` gate among its supported operations, so no identity is
+        exported, not even an ``I`` gate in the circuit, and identity wires
+        (see ``num_qubits``) are not sent: Braket measures only the qubits a
+        non-identity gate touches. ``BraketExecutor`` and ``MarqovDevice`` insert a ``'0'`` at
+        each identity-wire position of the returned counts keys, since an
+        untouched wire is always in state 0.
+
         Returns:
             Braket Circuit object ready for execution.
         """
         require_braket()
-        return qf.circuit_to_braket(self._qf, translate=True)
+        # Declaring qubits 0..n-1 stops the converter from compacting labels.
+        return qf.circuit_to_braket(self._without_identities(), translate=True)
 
     def to_braket_native(self) -> BraketCircuit:
         """Export the Rigetti Rx/Rz/CZ/XY basis preserving source qubit labels.
@@ -249,15 +268,23 @@ class Circuit:
 
         The circuit is built on one register named ``q``, as
         ``qiskit.QuantumCircuit(n)`` would, so repeated exports are identical.
+        The register has ``num_qubits`` qubits and qubit ``i`` is ``q[i]``;
+        identity wires are idle register qubits.
 
         Returns:
             Qiskit QuantumCircuit object.
         """
         from qiskit import QuantumCircuit, QuantumRegister
+        from quantumflow import xqiskit
 
+        # Translation rebuilds the circuit on the touched qubits only, so
+        # redeclare the full width before the converter sizes the register.
+        translated = xqiskit.translate_to_qiskit(self._qf)
+        if self._unnamed_qubits():
+            translated = qf.Circuit(translated, qubits=list(range(self.num_qubits)))
         # The converter leaves the register unnamed, so Qiskit names it from a
         # process-global counter (q0, q1, ...); move the gates onto "q".
-        exported = qf.transpile(self._qf, output_format="qiskit")
+        exported = xqiskit.circuit_to_qiskit(translated)
         circuit = QuantumCircuit(QuantumRegister(exported.num_qubits, "q"))
         circuit.compose(exported, qubits=range(exported.num_qubits), inplace=True)
         return circuit
@@ -265,10 +292,14 @@ class Circuit:
     def to_cirq(self):
         """Convert to Google Cirq circuit.
 
+        Qubit ``i`` is ``cirq.LineQubit(i)``. A Cirq circuit has no register
+        width, so each identity wire (see ``num_qubits``) is exported as a
+        ``cirq.I`` operation; ``from_cirq`` drops those again.
+
         Returns:
             Cirq Circuit object.
         """
-        return qf.transpile(self._qf, output_format="cirq")
+        return qf.transpile(self._padded_qf(), output_format="cirq")
 
     # QuantumFlow gate name -> Quil gate name. The fork's map spells two of
     # these wrong ("PhaseShift", "CHPHASE10"), which pyQuil cannot interpret.
@@ -284,7 +315,13 @@ class Circuit:
         Gates outside the Quil-native set (for example Braket's ``V``, ``XY``
         or ``CY``) are first translated into Quil-native gates, so the program
         equals the circuit up to a global phase (Quil has no global-phase
-        gate). Every parameter is exported as a float.
+        gate). Every parameter is exported as a float. Qubit ``i`` stays Quil
+        qubit ``i``; labels are not compacted. A Quil program has no register
+        width, and on QCS its labels are physical qubits, so no identity is
+        exported (not even an ``I`` gate in the circuit) and no identity wire
+        (see ``num_qubits``) is named.
+        ``RigettiExecutor`` measures only the touched qubits and inserts a
+        ``'0'`` at each identity-wire position of the counts keys.
 
         Returns:
             PyQuil Program object.
@@ -311,7 +348,7 @@ class Circuit:
         # Translation leaves sympy expressions such as `pi/2` in parameters,
         # which pyQuil rejects, so cast them to floats.
         program = Program()
-        for index, op in enumerate(qf.xforest.translate_to_pyquil(self._qf)):
+        for index, op in enumerate(qf.xforest.translate_to_pyquil(self._without_identities())):
             quil_name = self._QF_TO_QUIL.get(op.name)
             if quil_name is None:
                 raise NotImplementedError(
@@ -323,6 +360,9 @@ class Circuit:
 
     def to_pytket(self):
         """Convert to pytket Circuit.
+
+        Built from ``to_qiskit()``, so it has ``num_qubits`` qubits and qubit
+        ``i`` is ``q[i]``, identity wires included.
 
         Returns:
             pytket Circuit object.
@@ -348,6 +388,10 @@ class Circuit:
 
     def to_openqasm(self, version: int = 2) -> str:
         """Export circuit as an OpenQASM string.
+
+        Built from ``to_qiskit()``: the register ``q`` is declared with
+        ``num_qubits`` qubits and qubit ``i`` is ``q[i]``, identity wires
+        included.
 
         Args:
             version: QASM version to export (2 or 3). Defaults to 2.
@@ -399,7 +443,9 @@ class Circuit:
         marqov-dev/marqov-sdk#38. This is the only place PennyLane export reads
         QuantumFlow internals. The canonical gates map one-to-one onto
         PennyLane operations with identical matrices (including phase), on
-        the same integer wires.
+        the same integer wires. A script has no register width, so each
+        identity wire (see ``num_qubits``) is a leading ``qml.Identity``;
+        ``from_pennylane`` drops those again.
 
         The script carries no measurements and no shots: a ``Circuit`` is
         gate-only, and the executor decides what to measure (see
@@ -423,7 +469,7 @@ class Circuit:
                 "Install with: pip install marqov[pennylane]"
             )
 
-        operations = []
+        operations = [qml.Identity(wires=qubit) for qubit in self._unnamed_qubits()]
         for index, op in enumerate(self._qf._elements):
             name = op.name
             if name not in self._QF_TO_PENNYLANE:
@@ -462,10 +508,13 @@ class Circuit:
     def simulate(self) -> qf.State:
         """Run circuit on local simulator.
 
+        The state covers qubits ``0..num_qubits-1``, identity wires included,
+        with qubit 0 as the first (most significant) tensor axis.
+
         Returns:
             QuantumFlow State object with simulation results.
         """
-        return self._qf.run()
+        return self._wide_qf().run()
 
     # Import methods
 
@@ -478,7 +527,10 @@ class Circuit:
         before importing; their modifiers would be lost by the converter.
         Terminal measurements (nothing after them touches the measured qubit)
         are skipped; as in ``from_qiskit``, a qubit that only a measurement
-        touches is not part of the returned circuit. Result types (e.g.
+        touches gets no gate in the returned circuit (it is still an identity
+        wire when a higher index is used, see ``num_qubits``). An identity
+        (``i``) gate is dropped when another gate touches a higher index, and
+        kept as an ``I`` gate otherwise so the width is kept. Result types (e.g.
         ``probability()``) are not imported: the returned circuit carries
         gates only.
 
@@ -523,7 +575,6 @@ class Circuit:
                     f"'{instruction.operator.name}' at index {index}. Only gates "
                     "and terminal measurements are supported."
                 )
-            gate_instructions.append(instruction)
             if instruction.control or instruction.power != 1:
                 raise NotImplementedError(
                     f"Circuit.from_braket(): unsupported modifiers for gate "
@@ -533,7 +584,9 @@ class Circuit:
                     f"power={instruction.power}. Use explicit supported gates "
                     "or decompose modified instructions before importing."
                 )
+            gate_instructions.append(instruction)
         circuit._qf = qf.braket_to_circuit(braket_circuits.Circuit(gate_instructions))
+        circuit._drop_inner_identities()
         return circuit
 
     # Qiskit gate name -> Circuit fluent method mapping.
@@ -591,7 +644,10 @@ class Circuit:
         basis set via Qiskit's transpiler. This covers any circuit built from
         Qiskit's standard gate set, but a circuit containing an opaque custom
         gate (no `_define`) makes the transpiler itself raise — that error is
-        not caught here and propagates to the caller.
+        not caught here and propagates to the caller. An identity (``id``)
+        gate is dropped when another gate touches a higher index (the wire
+        stays in the width, see ``num_qubits``), and kept as an ``I`` gate
+        otherwise so the width is kept.
 
         Requires Qiskit to be installed (``pip install marqov[qiskit]``).
 
@@ -627,9 +683,11 @@ class Circuit:
             )
 
         # Decompose to our supported basis gate set.
+        # `id` stays in the basis so it is imported as an identity rather than
+        # being decomposed into an Rx(0) gate.
         decomposed = transpile(
             qiskit_circuit,
-            basis_gates=cls._QISKIT_BASIS_GATES,
+            basis_gates=[*cls._QISKIT_BASIS_GATES, "id"],
             optimization_level=0,
         )
 
@@ -661,6 +719,10 @@ class Circuit:
                     "under this SDK's gate-only circuit model."
                 )
 
+            if name == "id":
+                circuit._qf += qf.I(decomposed.find_bit(instruction.qubits[0]).index)
+                continue
+
             if name not in cls._QISKIT_GATE_MAP:
                 raise ValueError(
                     f"Unsupported gate '{name}' after decomposition. "
@@ -678,6 +740,7 @@ class Circuit:
             else:
                 getattr(circuit, method_name)(qubits[0], qubits[1])
 
+        circuit._drop_inner_identities()
         return circuit
 
     @classmethod
@@ -748,6 +811,8 @@ class Circuit:
             key = op.gate.key
             is_terminal = True
             for later in operations[index + 1 :]:
+                if isinstance(later.gate, cirq.IdentityGate):
+                    continue  # An identity after a measurement changes nothing.
                 if qubits & set(later.qubits):
                     is_terminal = False
                     break
@@ -777,6 +842,12 @@ class Circuit:
             return False
 
         qubits = [q.x for q in op.qubits]
+
+        # Identity: kept here, then dropped below the largest other index.
+        if isinstance(gate, cirq.IdentityGate):
+            for qubit in qubits:
+                circuit._qf += qf.I(qubit)
+            return True
 
         # Single-qubit fixed gates.
         if isinstance(gate, cirq.HPowGate) and gate.exponent == 1:
@@ -821,7 +892,9 @@ class Circuit:
         Known gates are mapped directly. Unsupported gates are automatically
         decomposed via ``cirq.decompose()`` until they resolve to gates we
         can map. If decomposition fails, a ``ValueError`` is raised and the
-        gate type is reported to Sentry for observability.
+        gate type is reported to Sentry for observability. An identity gate
+        is dropped when another gate touches a higher index (the wire stays in
+        the width, see ``num_qubits``), and kept as an ``I`` gate otherwise.
 
         Requires Cirq to be installed (``pip install marqov[cirq]``).
 
@@ -915,6 +988,7 @@ class Circuit:
                 f"issue at https://github.com/marqov-dev/marqov-sdk/issues"
             )
 
+        circuit._drop_inner_identities()
         return circuit
 
     # PennyLane gate name -> Circuit fluent method mapping.
@@ -944,7 +1018,9 @@ class Circuit:
         Known gates are mapped directly. Unsupported gates are automatically
         decomposed via ``op.decomposition()`` until they resolve to gates we
         can map. If decomposition fails, a ``ValueError`` is raised and the
-        gate type is reported to Sentry for observability.
+        gate type is reported to Sentry for observability. ``Identity`` is
+        dropped when another gate touches a higher wire (the wire stays in the
+        width, see ``num_qubits``), and kept as an ``I`` gate otherwise.
 
         Requires PennyLane to be installed (``pip install marqov[pennylane]``).
 
@@ -997,6 +1073,11 @@ class Circuit:
 
                 wires = [int(wire) for wire in op.wires]
 
+                if name == "Identity":
+                    for wire in wires:
+                        circuit._qf += qf.I(wire)
+                    continue
+
                 if name in cls._PENNYLANE_GATE_MAP:
                     method_name = cls._PENNYLANE_GATE_MAP[name]
                     if name in cls._PENNYLANE_ROTATION_GATES:
@@ -1037,6 +1118,7 @@ class Circuit:
 
         # tape.operations excludes measurements — no skip logic needed.
         _process_operations(tape.operations)
+        circuit._drop_inner_identities()
         return circuit
 
     # PyQuil gate name -> Circuit fluent method mapping.
@@ -1135,7 +1217,8 @@ class Circuit:
         SWAP is accepted either as a native ``SWAP`` instruction or as the
         standard three-``CNOT`` decomposition. Classical declarations and
         terminal measurements (nothing after them touches the measured qubit)
-        are skipped. Gate modifiers (including ``DAGGER``, ``CONTROLLED`` and
+        are skipped. An ``I`` gate is dropped when another gate touches a
+        higher qubit, and kept otherwise so the width is kept. Gate modifiers (including ``DAGGER``, ``CONTROLLED`` and
         ``FORKED``), Quil-native gates outside the canonical set, and mid-circuit
         measurements raise ``NotImplementedError`` so callers can decompose
         them explicitly before importing. Modifiers are checked before the
@@ -1212,6 +1295,9 @@ class Circuit:
                 )
 
             name = instruction.name.upper()
+            if name == "I":
+                circuit._qf += qf.I(instruction.get_qubit_indices()[0])
+                continue
             if name not in cls._PYQUIL_GATE_MAP:
                 raise NotImplementedError(
                     f"Unsupported PyQuil gate '{name}'. Supported gates: "
@@ -1229,13 +1315,17 @@ class Circuit:
             else:
                 getattr(circuit, method_name)(qubits[0], qubits[1])
 
+        circuit._drop_inner_identities()
         return circuit
 
     @classmethod
     def from_openqasm(cls, qasm_string: str) -> Circuit:
         """Import a circuit from an OpenQASM 2.0 or 3.0 string.
 
-        Auto-detects the QASM version from the header and parses via Qiskit.
+        Auto-detects the QASM version from the header and parses via Qiskit,
+        then imports with ``from_qiskit``, which handles a QASM 2 ``id`` gate
+        as an identity. Qiskit's QASM 3 reader turns ``id`` into a ``U`` gate,
+        which is decomposed instead.
 
         Args:
             qasm_string: OpenQASM program string.
@@ -1415,8 +1505,84 @@ class Circuit:
 
     @property
     def num_qubits(self) -> int:
-        """Return number of qubits in circuit."""
-        return self._qf.qubit_nb
+        """Return the circuit width: the largest qubit index touched, plus one.
+
+        Indices below the largest that no gate touches are identity wires and
+        still count, so ``Circuit().x(2).num_qubits == 3`` and an empty
+        circuit has width 0. An identity gate counts toward the width, but a
+        wire it alone touches is an identity wire too. Counts keys from ``LocalExecutor`` have this many
+        characters, with qubit 0 the leftmost: ``Circuit().x(2)`` yields
+        ``{"001": shots}``.
+
+        Raises:
+            ValueError: If a qubit label is not a nonnegative integer.
+        """
+        qubits = self._qf.qubits
+        for qubit in qubits:
+            if isinstance(qubit, (bool, np.bool_)) or not isinstance(qubit, Integral) or qubit < 0:
+                raise ValueError(
+                    f"Circuit qubit labels must be nonnegative integers, got {qubit!r}"
+                )
+        return int(max(qubits)) + 1 if qubits else 0
+
+    def _drop_inner_identities(self) -> None:
+        """Drop imported identity gates on wires below the largest other index.
+
+        Such a wire stays in the width as an identity wire, so dropping the
+        gate loses nothing. An identity above every other gate is the only
+        record of its wire and is kept, so the imported width is kept.
+        """
+        others = [int(q) for op in self._qf if not isinstance(op, qf.I) for q in op.qubits]
+        top = max(others, default=-1)
+        kept = [
+            op for op in self._qf
+            if not isinstance(op, qf.I) or any(int(q) > top for q in op.qubits)
+        ]
+        if len(kept) != len(self._qf):
+            self._qf = qf.Circuit(kept)
+
+    def _idle_qubits(self) -> list[int]:
+        """Return the identity wires: indices below the width that only identities touch.
+
+        A wire whose only gates are identities is in state 0 as surely as an
+        untouched one, so it is an identity wire too.
+        """
+        touched = {int(q) for op in self._qf if not isinstance(op, qf.I) for q in op.qubits}
+        return [qubit for qubit in range(self.num_qubits) if qubit not in touched]
+
+    def _unnamed_qubits(self) -> list[int]:
+        """Return the indices below the width that no operation names at all."""
+        named = {int(qubit) for qubit in self._qf.qubits}
+        return [qubit for qubit in range(self.num_qubits) if qubit not in named]
+
+    def _wide_qf(self) -> qf.Circuit:
+        """Return the QuantumFlow circuit declared on qubits ``0..num_qubits-1``."""
+        if not self._unnamed_qubits():
+            return self._qf
+        return qf.Circuit(self._qf._elements, qubits=list(range(self.num_qubits)))
+
+    def _without_identities(self) -> qf.Circuit:
+        """Return the circuit without identity gates, declared on ``0..num_qubits-1``.
+
+        For providers that are sent no identity (Braket, Quil): identity wires
+        are restored in the counts keys instead.
+        """
+        ops = [op for op in self._qf if not isinstance(op, qf.I)]
+        if len(ops) == len(self._qf) and not self._unnamed_qubits():
+            return self._qf
+        return qf.Circuit(ops, qubits=list(range(self.num_qubits)))
+
+    def _padded_qf(self) -> qf.Circuit:
+        """Return the circuit with an explicit identity gate on each unnamed wire.
+
+        For Cirq, which has no register-width declaration, an idle wire
+        exists only if an operation names it (PennyLane pads separately).
+        Braket and Quil are not padded, see ``to_braket`` and ``to_pyquil``.
+        """
+        unnamed = self._unnamed_qubits()
+        if not unnamed:
+            return self._qf
+        return qf.Circuit([qf.I(qubit) for qubit in unnamed] + list(self._qf._elements))
 
     def __repr__(self) -> str:
         """Return string representation."""

@@ -144,3 +144,61 @@ def allocate_counts(probabilities: dict[str, float], shots: int) -> dict[str, in
             i += 1
 
     return {key: count for key, count in counts.items() if count > 0}
+
+
+def widen_counts(
+    circuit: Any, counts: dict[str, int], measured_qubits: Any, provider: str
+) -> dict[str, int]:
+    """Key counts over qubits ``0..circuit.num_qubits-1`` by restoring identity wires.
+
+    Shared by the Braket and Rigetti paths, which send only the qubits a
+    non-identity gate touches (any other index below the width is an
+    identity wire, see ``Circuit.num_qubits``). An untouched wire is always in
+    state 0, so a ``'0'`` is inserted at its position; character ``j`` of a
+    provider key is ``measured_qubits[j]``, or the ``j``-th touched qubit in
+    ascending order when ``measured_qubits`` is empty or None.
+
+    Raises:
+        ValueError: If the measured qubits are not the circuit's touched
+            qubits, or a key's length is not the number of measured qubits.
+    """
+    width = circuit.num_qubits
+    touched = sorted(set(range(width)) - set(circuit._idle_qubits()))
+    wires = [int(q) for q in measured_qubits] if measured_qubits else touched
+    if sorted(wires) != touched:
+        raise ValueError(
+            f"{provider} measured qubits {wires} do not match the circuit's touched qubits "
+            f"{touched}; cannot place its identity wires in the counts keys"
+        )
+    for key in counts:
+        if len(key) != len(wires):
+            raise ValueError(
+                f"{provider} counts key {key!r} has {len(key)} characters, not the "
+                f"{len(wires)} measured qubits {wires}; cannot place its identity wires"
+            )
+    widened: dict[str, int] = {}
+    for key, count in counts.items():
+        bits = ["0"] * width
+        for wire, bit in zip(wires, key):
+            bits[wire] = bit
+        padded = "".join(bits)
+        widened[padded] = widened.get(padded, 0) + count
+    return widened
+
+
+def refuse_identity_only(circuit: Any, provider: str) -> None:
+    """Refuse a nonempty circuit whose every gate is an identity, before submission.
+
+    The Braket and Quil exports send no identity gate, so such a circuit
+    exports an empty program, which the provider would refuse or run with
+    nothing measured. Counts are not fabricated in its place.
+
+    Raises:
+        ValueError: If the circuit has gates but none other than identities.
+    """
+    width = circuit.num_qubits
+    if width and len(circuit._idle_qubits()) == width:
+        raise ValueError(
+            f"{provider}: circuit has no non-identity gates; {provider} is sent no identity "
+            "gate, so the program would be empty and there is nothing to run"
+        )
