@@ -496,6 +496,8 @@ class Circuit:
         "CNot": "CNOT",
         "CZ": "CZ",
         "Swap": "SWAP",
+        "CCNot": "Toffoli",
+        "CSwap": "CSWAP",
     }
 
     def to_pennylane(self) -> QuantumScript:

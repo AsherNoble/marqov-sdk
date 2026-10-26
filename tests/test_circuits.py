@@ -1256,12 +1256,14 @@ class TestOpenQASM:
 
     @staticmethod
     def _single_gate_circuit(method_name: str) -> Circuit:
-        """A two-qubit circuit whose last gate is ``method_name``."""
+        """A circuit on qubits 0-1 (0-2 for 3-qubit gates) ending in ``method_name``."""
         circuit = Circuit().h(0).h(1)
         if method_name in Circuit._ROTATION_GATES:
             return getattr(circuit, method_name)(0.37, 0)
         if method_name in ("cnot", "cz", "swap"):
             return getattr(circuit, method_name)(0, 1)
+        if method_name in ("ccx", "cswap"):
+            return getattr(circuit, method_name)(0, 1, 2)
         return getattr(circuit, method_name)(0)
 
     @pytest.mark.parametrize("version", [2, 3])
@@ -1278,8 +1280,8 @@ class TestOpenQASM:
             atol=1e-12, rtol=1e-12,
         )
 
-    def test_canonical_gate_set_has_twelve_gates(self) -> None:
-        assert len(set(Circuit._QISKIT_GATE_MAP.values())) == 12
+    def test_canonical_gate_set_has_fourteen_gates(self) -> None:
+        assert len(set(Circuit._QISKIT_GATE_MAP.values())) == 14
 
     @pytest.mark.parametrize("version", [2, 3])
     def test_export_is_deterministic(self, version) -> None:
@@ -1498,6 +1500,7 @@ class TestToPennylane:
             .cnot(0, 1).h(0).x(0).y(0).z(0).s(0).t(0)
             .rx(angle, 0).ry(angle, 1).rz(angle, 0)
             .cz(0, 1).swap(0, 1)
+            .ccx(0, 1, 2).cswap(0, 1, 2)
         )
 
     def test_every_canonical_gate_maps_to_its_pennylane_operation(self) -> None:
@@ -1509,8 +1512,19 @@ class TestToPennylane:
             qml.CNOT(wires=[0, 1]), qml.Hadamard(0), qml.PauliX(0), qml.PauliY(0),
             qml.PauliZ(0), qml.S(0), qml.T(0), qml.RX(0.5, wires=0),
             qml.RY(0.5, wires=1), qml.RZ(0.5, wires=0), qml.CZ(wires=[0, 1]),
-            qml.SWAP(wires=[0, 1]),
+            qml.SWAP(wires=[0, 1]), qml.Toffoli(wires=[0, 1, 2]),
+            qml.CSWAP(wires=[0, 1, 2]),
         ]
+        assert len(script.operations) == len(expected)
+        for got, want in zip(script.operations, expected):
+            qml.assert_equal(got, want)
+
+    def test_three_qubit_gates_keep_wire_order(self) -> None:
+        """Toffoli/CSWAP keep control and target wires in order, even out of index order."""
+        import pennylane as qml
+
+        script = Circuit().ccx(2, 0, 1).cswap(1, 2, 0).to_pennylane()
+        expected = [qml.Toffoli(wires=[2, 0, 1]), qml.CSWAP(wires=[1, 2, 0])]
         assert len(script.operations) == len(expected)
         for got, want in zip(script.operations, expected):
             qml.assert_equal(got, want)
@@ -1575,6 +1589,6 @@ class TestToPennylane:
         import quantumflow as qf
 
         circuit = Circuit().h(0)
-        circuit._qf += qf.CCNot(0, 1, 2)
-        with pytest.raises(NotImplementedError, match="CCNot"):
+        circuit._qf += qf.ISwap(0, 1)
+        with pytest.raises(NotImplementedError, match="ISwap"):
             circuit.to_pennylane()
